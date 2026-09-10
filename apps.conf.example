@@ -1,0 +1,15 @@
+# Apps Control Center config
+# Format: [profile] header, then name: folder | command
+# [utilities] apps are always available and keep running across profile switches.
+# Omit headers for a single "default" profile (backwards compatible).
+
+[utilities]
+mailpit: ~/tools/mailpit | ./mailpit
+
+[work]
+api: ~/work/api | php artisan serve
+web: ~/work/web | npm run dev
+worker: ~/work/api | php artisan queue:work
+
+[personal]
+blog: ~/personal/blog | npm run dev

@@ -1,0 +1,6 @@
+bin/
+cmd/
+*.exe
+apps.conf
+.idea/*
+.DS_Store/*
