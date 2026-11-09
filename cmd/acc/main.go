@@ -30,7 +30,9 @@ func main() {
 			p.Send(msg)
 		}
 	})
-	p = tea.NewProgram(model, tea.WithAltScreen())
+	// Mouse cell motion so wheel arrives as MouseMsg (throttled) instead of
+	// a burst of up/down key events that thrash selection and CPU.
+	p = tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 
 	if err := model.StartWatcher(); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: config watch disabled: %v\n", err)

@@ -1,15 +1,27 @@
 # Apps Control Center config
-# Format: [profile] header, then name: folder | command
-# [utilities] apps are always available and keep running across profile switches.
-# Omit headers for a single "default" profile (backwards compatible).
+#
+# [profile]              selectable profile
+# [utilities]            always available across profile switches
+# @name: folder          named project — following commands share cwd
+# @folder                same, project label = folder basename
+# name: folder | cmd     classic one-liner (exits current @ project)
+# name: cmd              command only
+#
+# Omit headers for a single "default" profile.
 
 [utilities]
 mailpit: ~/tools/mailpit | ./mailpit
 
 [work]
-api: ~/work/api | php artisan serve
-web: ~/work/web | npm run dev
-worker: ~/work/api | php artisan queue:work
+@api: ~/work/api
+serve: php artisan serve
+queue: php artisan queue:work
+pail: php artisan pail
+
+@web: ~/work/web
+vite: npm run dev
 
 [personal]
-blog: ~/personal/blog | npm run dev
+@blog: ~/personal/blog
+dev: npm run dev
+build: npm run build

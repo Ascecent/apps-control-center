@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/ascecent/apps-control-center/internal/config"
+	"github.com/ascecent/apps-control-center/internal/gitinfo"
 	"github.com/ascecent/apps-control-center/internal/openers"
 	"github.com/ascecent/apps-control-center/internal/process"
 	"github.com/ascecent/apps-control-center/internal/watcher"
@@ -20,10 +21,13 @@ type exitMsg process.ExitEvent
 type configReloadMsg struct{}
 type statusTickMsg time.Time
 
-// listEntry is one row in the combined list (profile app or utility).
+// listEntry is one row in the combined list (project header or runnable app).
 type listEntry struct {
-	App     config.App
-	Utility bool
+	App          config.App
+	Utility      bool
+	IsHeader     bool
+	HeaderName   string
+	HeaderFolder string
 }
 
 type Model struct {
@@ -56,6 +60,13 @@ type Model struct {
 
 	pickingProfile bool
 	profileCursor  int
+
+	// Cached on tick so View does not walk /proc / git on every redraw.
+	usageCache map[string]process.Usage
+	urlCache   map[string]string
+	gitCache   map[string]gitinfo.Info // folder → git info
+
+	lastWheelMove time.Time
 }
 
 func New(path string, cfg *config.Config, activeProfile string, send func(tea.Msg)) *Model {
@@ -64,6 +75,9 @@ func New(path string, cfg *config.Config, activeProfile string, send func(tea.Ms
 		cfg:           cfg,
 		activeProfile: activeProfile,
 		send:          send,
+		usageCache:    make(map[string]process.Usage),
+		urlCache:      make(map[string]string),
+		gitCache:      make(map[string]gitinfo.Info),
 	}
 	m.mgr = process.New(func(ev process.ExitEvent) {
 		if send != nil {
@@ -74,25 +88,56 @@ func New(path string, cfg *config.Config, activeProfile string, send func(tea.Ms
 	m.utilityApps = append([]config.App(nil), cfg.Utilities...)
 	m.rebuildEntries()
 	for _, a := range m.profileApps {
-		m.mgr.Ensure(a.Name, a.Folder, a.Command)
+		m.mgr.Ensure(a.Key(), a.Folder, a.Command)
 	}
 	for _, a := range m.utilityApps {
-		m.mgr.Ensure(a.Name, a.Folder, a.Command)
+		m.mgr.Ensure(a.Key(), a.Folder, a.Command)
 	}
 	return m
 }
 
 func (m *Model) rebuildEntries() {
 	m.entries = m.entries[:0]
-	for _, a := range m.profileApps {
-		m.entries = append(m.entries, listEntry{App: a, Utility: false})
+	m.entries = appendAppsGrouped(m.entries, m.profileApps, false)
+	m.entries = appendAppsGrouped(m.entries, m.utilityApps, true)
+	if m.cursor >= len(m.entries) || (len(m.entries) > 0 && m.entries[m.cursor].IsHeader) {
+		m.cursor = firstSelectable(m.entries)
 	}
-	for _, a := range m.utilityApps {
-		m.entries = append(m.entries, listEntry{App: a, Utility: true})
+	m.refreshGitCache()
+}
+
+func appendAppsGrouped(dst []listEntry, apps []config.App, utility bool) []listEntry {
+	lastProject, lastFolder := "", ""
+	inGroup := false
+	for _, a := range apps {
+		if a.Project != "" {
+			if !inGroup || a.Project != lastProject || a.Folder != lastFolder {
+				dst = append(dst, listEntry{
+					IsHeader:     true,
+					HeaderName:   a.Project,
+					HeaderFolder: a.Folder,
+					Utility:      utility,
+				})
+				lastProject, lastFolder = a.Project, a.Folder
+				inGroup = true
+			}
+			dst = append(dst, listEntry{App: a, Utility: utility})
+			continue
+		}
+		inGroup = false
+		lastProject, lastFolder = "", ""
+		dst = append(dst, listEntry{App: a, Utility: utility})
 	}
-	if m.cursor >= len(m.entries) {
-		m.cursor = max(0, len(m.entries)-1)
+	return dst
+}
+
+func firstSelectable(entries []listEntry) int {
+	for i, e := range entries {
+		if !e.IsHeader {
+			return i
+		}
 	}
+	return 0
 }
 
 func (m *Model) StartWatcher() error {
@@ -125,10 +170,102 @@ func (m Model) Init() tea.Cmd {
 	return tick()
 }
 
+const wheelThrottle = 90 * time.Millisecond
+
 func tick() tea.Cmd {
 	return tea.Tick(500*time.Millisecond, func(t time.Time) tea.Msg {
 		return statusTickMsg(t)
 	})
+}
+
+func (m *Model) refreshCaches() {
+	m.selfUse = process.SelfUsage()
+	if m.usageCache == nil {
+		m.usageCache = make(map[string]process.Usage)
+	}
+	if m.urlCache == nil {
+		m.urlCache = make(map[string]string)
+	}
+	seen := make(map[string]bool, len(m.entries))
+	for _, e := range m.entries {
+		if e.IsHeader {
+			continue
+		}
+		key := e.App.Key()
+		seen[key] = true
+		st, _, _ := m.mgr.Status(key)
+		if st == process.StatusRunning {
+			m.usageCache[key] = m.mgr.Usage(key)
+			m.urlCache[key] = m.mgr.URL(key)
+		} else {
+			delete(m.usageCache, key)
+			delete(m.urlCache, key)
+		}
+	}
+	for name := range m.usageCache {
+		if !seen[name] {
+			delete(m.usageCache, name)
+		}
+	}
+	for name := range m.urlCache {
+		if !seen[name] {
+			delete(m.urlCache, name)
+		}
+	}
+	m.refreshGitCache()
+}
+
+func (m *Model) refreshGitCache() {
+	if m.gitCache == nil {
+		m.gitCache = make(map[string]gitinfo.Info)
+	}
+	needed := make(map[string]bool)
+	for _, e := range m.entries {
+		folder := ""
+		if e.IsHeader {
+			folder = e.HeaderFolder
+		} else if e.App.Project == "" {
+			// Ungrouped apps: git shown on the selected row.
+			folder = e.App.Folder
+		}
+		if folder == "" {
+			continue
+		}
+		needed[folder] = true
+		m.gitCache[folder] = gitinfo.Detect(folder)
+	}
+	for folder := range m.gitCache {
+		if !needed[folder] {
+			delete(m.gitCache, folder)
+		}
+	}
+}
+
+func (m *Model) moveCursor(delta int) {
+	if len(m.entries) == 0 || delta == 0 {
+		return
+	}
+	next := m.cursor
+	for {
+		next += delta
+		if next < 0 || next >= len(m.entries) {
+			return
+		}
+		if !m.entries[next].IsHeader {
+			m.cursor = next
+			return
+		}
+	}
+}
+
+func (m *Model) moveCursorWheel(delta int) bool {
+	now := time.Now()
+	if !m.lastWheelMove.IsZero() && now.Sub(m.lastWheelMove) < wheelThrottle {
+		return false
+	}
+	m.lastWheelMove = now
+	m.moveCursor(delta)
+	return true
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -140,7 +277,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case statusTickMsg:
-		m.selfUse = process.SelfUsage()
+		m.refreshCaches()
 		return m, tick()
 
 	case exitMsg:
@@ -156,6 +293,64 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m.reloadConfig()
+
+	case tea.MouseMsg:
+		if m.editing {
+			var cmd tea.Cmd
+			m.editor, cmd = m.editor.Update(msg)
+			return m, cmd
+		}
+		if !tea.MouseEvent(msg).IsWheel() {
+			return m, nil
+		}
+		delta := 0
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			delta = -1
+		case tea.MouseButtonWheelDown:
+			delta = 1
+		default:
+			return m, nil
+		}
+		if m.pickingProfile {
+			names := m.cfg.ProfileNames()
+			if len(names) == 0 {
+				return m, nil
+			}
+			now := time.Now()
+			if !m.lastWheelMove.IsZero() && now.Sub(m.lastWheelMove) < wheelThrottle {
+				return m, nil
+			}
+			m.lastWheelMove = now
+			m.profileCursor += delta
+			if m.profileCursor < 0 {
+				m.profileCursor = 0
+			}
+			if m.profileCursor >= len(names) {
+				m.profileCursor = len(names) - 1
+			}
+			return m, nil
+		}
+		if m.picking {
+			if len(m.pickEditors) == 0 {
+				return m, nil
+			}
+			now := time.Now()
+			if !m.lastWheelMove.IsZero() && now.Sub(m.lastWheelMove) < wheelThrottle {
+				return m, nil
+			}
+			m.lastWheelMove = now
+			m.pickCursor += delta
+			if m.pickCursor < 0 {
+				m.pickCursor = 0
+			}
+			if m.pickCursor >= len(m.pickEditors) {
+				m.pickCursor = len(m.pickEditors) - 1
+			}
+			return m, nil
+		}
+		m.moveCursorWheel(delta)
+		return m, nil
 
 	case tea.KeyMsg:
 		if m.pickingProfile {
@@ -185,40 +380,36 @@ func (m Model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.Close()
 		return m, tea.Quit
 	case "up", "k":
-		if m.cursor > 0 {
-			m.cursor--
-		}
+		m.moveCursor(-1)
 	case "down", "j":
-		if m.cursor < len(m.entries)-1 {
-			m.cursor++
-		}
+		m.moveCursor(1)
 	case "s":
 		if app, ok := m.selected(); ok {
-			if err := m.mgr.Start(app.Name); err != nil {
+			if err := m.mgr.Start(app.Key()); err != nil {
 				m.status = err.Error()
 			} else {
-				m.status = fmt.Sprintf("started %s", app.Name)
+				m.status = fmt.Sprintf("started %s", app.Key())
 			}
 		}
 	case "d", "x":
 		if app, ok := m.selected(); ok {
-			if err := m.mgr.Stop(app.Name); err != nil {
+			if err := m.mgr.Stop(app.Key()); err != nil {
 				m.status = err.Error()
 			} else {
-				m.status = fmt.Sprintf("stopped %s", app.Name)
+				m.status = fmt.Sprintf("stopped %s", app.Key())
 			}
 		}
 	case "r":
 		if app, ok := m.selected(); ok {
-			if err := m.mgr.Restart(app.Name); err != nil {
+			if err := m.mgr.Restart(app.Key()); err != nil {
 				m.status = err.Error()
 			} else {
-				m.status = fmt.Sprintf("restarted %s", app.Name)
+				m.status = fmt.Sprintf("restarted %s", app.Key())
 			}
 		}
 	case "o":
 		if app, ok := m.selected(); ok {
-			u := m.mgr.URL(app.Name)
+			u := m.mgr.URL(app.Key())
 			if u == "" {
 				m.status = "no URL detected yet"
 				break
@@ -245,7 +436,11 @@ func (m Model) selected() (config.App, bool) {
 	if len(m.entries) == 0 || m.cursor < 0 || m.cursor >= len(m.entries) {
 		return config.App{}, false
 	}
-	return m.entries[m.cursor].App, true
+	e := m.entries[m.cursor]
+	if e.IsHeader {
+		return config.App{}, false
+	}
+	return e.App, true
 }
 
 // ── profile picker ────────────────────────────────────────────────────────────
@@ -307,16 +502,16 @@ func (m Model) updateProfilePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m Model) switchProfile(name string) (tea.Model, tea.Cmd) {
 	// Stop only profile apps — utilities keep running.
 	for _, a := range m.profileApps {
-		m.mgr.Remove(a.Name)
+		m.mgr.Remove(a.Key())
 	}
 
 	m.activeProfile = name
 	m.profileApps = m.cfg.AppsFor(name)
 	for _, a := range m.profileApps {
-		m.mgr.Ensure(a.Name, a.Folder, a.Command)
+		m.mgr.Ensure(a.Key(), a.Folder, a.Command)
 	}
-	m.rebuildEntries()
 	m.cursor = 0
+	m.rebuildEntries()
 	m.pickingProfile = false
 	m.errFlash = ""
 	m.status = fmt.Sprintf("profile: %s", name)
@@ -407,7 +602,7 @@ func (m Model) openConfigEditor() (tea.Model, tea.Cmd) {
 	}
 
 	ta := textarea.New()
-	ta.Placeholder = "# [utilities]\n# [profile]\n# name: folder | command"
+	ta.Placeholder = "# [profile]\n# @api: ~/project\n# serve: command\n# name: folder | command"
 	ta.CharLimit = 0
 	ta.ShowLineNumbers = true
 	ta.Prompt = ""
@@ -502,11 +697,11 @@ func (m Model) reloadConfig() (tea.Model, tea.Cmd) {
 func reconcileApps(mgr *process.Manager, prev, next []config.App) {
 	prevMap := make(map[string]config.App, len(prev))
 	for _, a := range prev {
-		prevMap[a.Name] = a
+		prevMap[a.Key()] = a
 	}
 	nextMap := make(map[string]config.App, len(next))
 	for _, a := range next {
-		nextMap[a.Name] = a
+		nextMap[a.Key()] = a
 	}
 	for name, old := range prevMap {
 		if _, ok := nextMap[name]; !ok {
@@ -541,16 +736,16 @@ func (m Model) applyConfig(cfg *config.Config, status string) (tea.Model, tea.Cm
 			m.activeProfile = config.DefaultProfile
 		}
 		for _, a := range m.profileApps {
-			m.mgr.Remove(a.Name)
+			m.mgr.Remove(a.Key())
 		}
 		m.profileApps = cfg.AppsFor(m.activeProfile)
 		for _, a := range m.profileApps {
-			m.mgr.Ensure(a.Name, a.Folder, a.Command)
+			m.mgr.Ensure(a.Key(), a.Folder, a.Command)
 		}
 		reconcileApps(m.mgr, m.utilityApps, cfg.Utilities)
 		m.utilityApps = append([]config.App(nil), cfg.Utilities...)
-		m.rebuildEntries()
 		m.cursor = 0
+		m.rebuildEntries()
 		m.errFlash = ""
 		m.status = fmt.Sprintf("%s (profile %q gone → %q)", status, oldProfile, m.activeProfile)
 		return m, nil
@@ -702,6 +897,9 @@ func (m Model) viewList(compact bool) string {
 	} else {
 		nameW := 12
 		for _, e := range m.entries {
+			if e.IsHeader {
+				continue
+			}
 			if len(e.App.Name) > nameW {
 				nameW = len(e.App.Name)
 			}
@@ -720,10 +918,6 @@ func (m Model) viewList(compact bool) string {
 			if !e.Utility && !wroteProfileHeader {
 				b.WriteString(sectionStyle.Render("── " + m.activeProfile + " "))
 				b.WriteString("\n")
-				if !compact {
-					b.WriteString(helpStyle.Render(fmt.Sprintf("  %-*s  %-8s  %-12s  %s", nameW, "APP", "STATUS", "CPU  MEM", "COMMAND")))
-					b.WriteString("\n")
-				}
 				wroteProfileHeader = true
 			}
 			if e.Utility && !wroteUtilHeader {
@@ -735,19 +929,34 @@ func (m Model) viewList(compact bool) string {
 				wroteUtilHeader = true
 			}
 
-			a := e.App
-			st, code, errMsg := m.mgr.Status(a.Name)
-			appURL := ""
-			usage := process.Usage{}
-			if st == process.StatusRunning {
-				appURL = m.mgr.URL(a.Name)
-				usage = m.mgr.Usage(a.Name)
+			if e.IsHeader {
+				parts := []string{projectStyle.Render("  ▸ " + e.HeaderName)}
+				if e.HeaderFolder != "" {
+					parts = append(parts, mutedStyle.Render(shortPath(e.HeaderFolder)))
+				}
+				if gi, ok := m.gitCache[e.HeaderFolder]; ok && gi.OK {
+					parts = append(parts, gitStyle.Render("git: "+gi.String()))
+				}
+				b.WriteString(strings.Join(parts, "  "))
+				b.WriteString("\n")
+				continue
 			}
+
+			a := e.App
+			st, code, errMsg := m.mgr.Status(a.Key())
+			appURL := m.urlCache[a.Key()]
+			usage := m.usageCache[a.Key()]
 			cursor := "  "
 			lineStyle := itemStyle
 			if i == m.cursor {
-				cursor = "> "
+				if a.Project != "" {
+					cursor = "  > "
+				} else {
+					cursor = "> "
+				}
 				lineStyle = selectedStyle
+			} else if a.Project != "" {
+				cursor = "    "
 			}
 			cmd := a.Command
 			if len(cmd) > cmdMax {
@@ -758,17 +967,28 @@ func (m Model) viewList(compact bool) string {
 			b.WriteString(lineStyle.Render(line))
 			b.WriteString("\n")
 			if !compact && i == m.cursor {
-				if a.Folder != "" {
-					b.WriteString(mutedStyle.Render("    " + shortPath(a.Folder)))
-					b.WriteString("\n")
+				detailPad := "    "
+				if a.Project != "" {
+					detailPad = "      "
+				}
+				// Folder + git only for ungrouped apps; projects show those on the header.
+				if a.Project == "" {
+					if a.Folder != "" {
+						b.WriteString(mutedStyle.Render(detailPad + shortPath(a.Folder)))
+						b.WriteString("\n")
+					}
+					if gi, ok := m.gitCache[a.Folder]; ok && gi.OK {
+						b.WriteString(gitStyle.Render(detailPad + "git: " + gi.String()))
+						b.WriteString("\n")
+					}
 				}
 				if appURL != "" {
-					b.WriteString(linkStyle.Render("    " + appURL + "  (o open)"))
+					b.WriteString(linkStyle.Render(detailPad + appURL + "  (o open)"))
 					b.WriteString("\n")
 				}
 				if errMsg != "" && st == process.StatusFailed {
 					for _, errLine := range strings.Split(errMsg, "\n") {
-						b.WriteString(errorStyle.Render("    " + errLine))
+						b.WriteString(errorStyle.Render(detailPad + errLine))
 						b.WriteString("\n")
 					}
 				}
@@ -819,7 +1039,9 @@ var (
 	profileStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("0")).Background(lipgloss.Color("79"))
 	profileActiveStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("79"))
 	sectionStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Bold(true)
+	projectStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("117")).Bold(true)
 	mutedStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	gitStyle           = lipgloss.NewStyle().Foreground(lipgloss.Color("180"))
 	itemStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 	selectedStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("229")).Bold(true)
 	helpStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))

@@ -82,11 +82,39 @@ blog: npm run dev
 func TestUtilitiesNameConflict(t *testing.T) {
 	_, err := Parse("test", "[utilities]\napi: a\n\n[work]\napi: b\n")
 	if err == nil {
-		t.Fatal("expected conflict error")
+		t.Fatal("expected conflict error for same key")
 	}
 }
 
-func TestDuplicateWithinProfile(t *testing.T) {
+func TestDuplicateWithinProject(t *testing.T) {
+	_, err := Parse("test", "[work]\n@api: /tmp\nserve: a\nserve: b\n")
+	if err == nil {
+		t.Fatal("expected duplicate error within project")
+	}
+}
+
+func TestSameName_DifferentProjects(t *testing.T) {
+	cfg, err := Parse("test", `
+[work]
+@api: /tmp/api
+backend: php artisan serve
+
+@web: /tmp/web
+backend: npm run dev
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apps := cfg.AppsFor("work")
+	if len(apps) != 2 {
+		t.Fatalf("got %d apps", len(apps))
+	}
+	if apps[0].Key() != "api/backend" || apps[1].Key() != "web/backend" {
+		t.Fatalf("keys = %q, %q", apps[0].Key(), apps[1].Key())
+	}
+}
+
+func TestDuplicateUngroupedWithinProfile(t *testing.T) {
 	_, err := Parse("test", "[work]\napi: a\napi: b\n")
 	if err == nil {
 		t.Fatal("expected duplicate error")
@@ -119,6 +147,54 @@ func TestExpandTilde(t *testing.T) {
 	}
 	if !strings.HasSuffix(apps[0].Folder, "myapp") {
 		t.Fatal("expected expanded path")
+	}
+}
+
+func TestNamedProjectGroup(t *testing.T) {
+	dir := t.TempDir()
+	content := `
+[work]
+@api: ` + dir + `
+serve: php artisan serve
+queue: php artisan queue:work
+web: /tmp/web | npm run dev
+`
+	cfg, err := Parse("test", content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apps := cfg.AppsFor("work")
+	if len(apps) != 3 {
+		t.Fatalf("got %d apps: %+v", len(apps), apps)
+	}
+	if apps[0].Name != "serve" || apps[0].Project != "api" || apps[0].Folder != dir {
+		t.Fatalf("serve = %+v", apps[0])
+	}
+	if apps[1].Name != "queue" || apps[1].Project != "api" || apps[1].Folder != dir {
+		t.Fatalf("queue = %+v", apps[1])
+	}
+	if apps[2].Name != "web" || apps[2].Project != "" || apps[2].Command != "npm run dev" {
+		t.Fatalf("web = %+v", apps[2])
+	}
+	absWeb, _ := filepath.Abs("/tmp/web")
+	if apps[2].Folder != absWeb {
+		t.Fatalf("web folder = %q, want %q", apps[2].Folder, absWeb)
+	}
+}
+
+func TestBareFolderGroupUsesBasename(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Parse("test", "@~/myapp\nserve: npm start\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	apps := cfg.AppsFor(DefaultProfile)
+	want := filepath.Join(home, "myapp")
+	if apps[0].Folder != want || apps[0].Project != "myapp" || apps[0].Command != "npm start" {
+		t.Fatalf("got %+v, want folder %q project myapp", apps[0], want)
 	}
 }
 

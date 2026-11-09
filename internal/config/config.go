@@ -17,8 +17,18 @@ const (
 // App is a named command from the config file.
 type App struct {
 	Name    string
+	Project string // optional project group label (from @name: folder)
 	Folder  string // absolute path after ~ expansion; empty if unset
 	Command string
+}
+
+// Key returns a unique process id. Same command names are allowed in different
+// projects; uniqueness is per project (or ungrouped within the profile).
+func (a App) Key() string {
+	if a.Project == "" {
+		return a.Name
+	}
+	return a.Project + "/" + a.Name
 }
 
 // Profile is a named group of apps (excludes utilities).
@@ -74,11 +84,19 @@ func Load(path string) (*Config, error) {
 // Parse parses config content.
 // Format:
 //
-//	[utilities]          # always available across profiles
-//	mailpit: ...
+//	[utilities]
+//	mailpit: ~/tools/mailpit | ./mailpit
 //
 //	[profile]
-//	name: folder | command
+//	name: folder | command          # classic one-liner
+//	name: command                   # no folder
+//
+//	@api: ~/work/api                # named project group
+//	serve: php artisan serve
+//	queue: php artisan queue:work
+//
+//	@~/other/path                   # unnamed — project label = folder basename
+//	dev: npm run dev
 //
 // Files without any [profile] header are treated as [default].
 // App names in [utilities] must not appear in any other profile.
@@ -89,18 +107,27 @@ func Parse(label, content string) (*Config, error) {
 	var profiles []Profile
 	var utilities []App
 	var curName string
-	seen := make(map[string]map[string]int) // section -> name -> line
-	utilNames := make(map[string]int)       // utility name -> line
+	var blockFolder string
+	var blockProject string
+	// section -> project -> appName -> line (project "" = ungrouped)
+	seen := make(map[string]map[string]map[string]int)
+	utilKeys := make(map[string]int) // App.Key() -> line
+
+	clearBlock := func() {
+		blockFolder = ""
+		blockProject = ""
+	}
 
 	ensureSection := func(name string) {
 		if curName == name {
 			return
 		}
 		curName = name
+		clearBlock()
+		if seen[name] == nil {
+			seen[name] = make(map[string]map[string]int)
+		}
 		if name == UtilitiesProfile {
-			if seen[name] == nil {
-				seen[name] = make(map[string]int)
-			}
 			return
 		}
 		for i := range profiles {
@@ -109,23 +136,27 @@ func Parse(label, content string) (*Config, error) {
 			}
 		}
 		profiles = append(profiles, Profile{Name: name})
-		seen[name] = make(map[string]int)
 	}
 
 	appendApp := func(app App, line int) error {
-		if curName == UtilitiesProfile {
-			if prev, dup := utilNames[app.Name]; dup {
-				return fmt.Errorf("%s:%d: duplicate utility %q (also line %d)", label, line, app.Name, prev)
+		sec := seen[curName]
+		if sec[app.Project] == nil {
+			sec[app.Project] = make(map[string]int)
+		}
+		projSeen := sec[app.Project]
+		if prev, dup := projSeen[app.Name]; dup {
+			if app.Project == "" {
+				return fmt.Errorf("%s:%d: duplicate app %q in profile %q (also line %d)", label, line, app.Name, curName, prev)
 			}
-			utilNames[app.Name] = line
+			return fmt.Errorf("%s:%d: duplicate app %q in project %q (also line %d)", label, line, app.Name, app.Project, prev)
+		}
+		projSeen[app.Name] = line
+
+		if curName == UtilitiesProfile {
+			utilKeys[app.Key()] = line
 			utilities = append(utilities, app)
 			return nil
 		}
-		profSeen := seen[curName]
-		if prev, dup := profSeen[app.Name]; dup {
-			return fmt.Errorf("%s:%d: duplicate app %q in profile %q (also line %d)", label, line, app.Name, curName, prev)
-		}
-		profSeen[app.Name] = line
 		for i := range profiles {
 			if profiles[i].Name == curName {
 				profiles[i].Apps = append(profiles[i].Apps, app)
@@ -155,9 +186,42 @@ func Parse(label, content string) (*Config, error) {
 			continue
 		}
 
+		// Project / folder group:
+		//   @name: folder
+		//   @folder          (project name = basename)
+		if strings.HasPrefix(line, "@") {
+			rest := strings.TrimSpace(strings.TrimPrefix(line, "@"))
+			if rest == "" {
+				return nil, fmt.Errorf("%s:%d: empty project after @", label, lineNum)
+			}
+			var project, folderRaw string
+			if proj, path, ok := strings.Cut(rest, ":"); ok {
+				project = strings.TrimSpace(proj)
+				folderRaw = strings.TrimSpace(path)
+				if project == "" {
+					return nil, fmt.Errorf("%s:%d: empty project name before :", label, lineNum)
+				}
+				if folderRaw == "" {
+					return nil, fmt.Errorf("%s:%d: empty folder after @%s:", label, lineNum, project)
+				}
+			} else {
+				folderRaw = rest
+			}
+			expanded, err := expandPath(folderRaw)
+			if err != nil {
+				return nil, fmt.Errorf("%s:%d: %w", label, lineNum, err)
+			}
+			blockFolder = expanded
+			if project == "" {
+				project = filepath.Base(expanded)
+			}
+			blockProject = project
+			continue
+		}
+
 		name, rest, ok := strings.Cut(line, ":")
 		if !ok {
-			return nil, fmt.Errorf("%s:%d: expected name: folder | command", label, lineNum)
+			return nil, fmt.Errorf("%s:%d: expected name: command or @project: folder", label, lineNum)
 		}
 		name = strings.TrimSpace(name)
 		rest = strings.TrimSpace(rest)
@@ -168,11 +232,22 @@ func Parse(label, content string) (*Config, error) {
 			return nil, fmt.Errorf("%s:%d: empty definition", label, lineNum)
 		}
 
-		folder, command := splitFolderCommand(rest)
+		var folder, command, project string
+		if strings.Contains(rest, "|") {
+			clearBlock()
+			folder, command = splitFolderCommand(rest)
+		} else if blockFolder != "" {
+			folder = blockFolder
+			project = blockProject
+			command = rest
+		} else {
+			folder, command = splitFolderCommand(rest)
+		}
+
 		if command == "" {
 			return nil, fmt.Errorf("%s:%d: empty command", label, lineNum)
 		}
-		if folder != "" {
+		if folder != "" && folder != blockFolder {
 			expanded, err := expandPath(folder)
 			if err != nil {
 				return nil, fmt.Errorf("%s:%d: %w", label, lineNum, err)
@@ -180,7 +255,7 @@ func Parse(label, content string) (*Config, error) {
 			folder = expanded
 		}
 
-		if err := appendApp(App{Name: name, Folder: folder, Command: command}, lineNum); err != nil {
+		if err := appendApp(App{Name: name, Project: project, Folder: folder, Command: command}, lineNum); err != nil {
 			return nil, err
 		}
 	}
@@ -199,11 +274,12 @@ func Parse(label, content string) (*Config, error) {
 		profiles = out
 	}
 
-	// Utilities names must not collide with any selectable profile app.
+	// Keys must not collide between utilities and any selectable profile
+	// (they share one process manager).
 	for _, p := range profiles {
 		for _, a := range p.Apps {
-			if utilLine, ok := utilNames[a.Name]; ok {
-				return nil, fmt.Errorf("%s: app %q in profile %q conflicts with [utilities] (line %d)", label, a.Name, p.Name, utilLine)
+			if utilLine, ok := utilKeys[a.Key()]; ok {
+				return nil, fmt.Errorf("%s: app %q in profile %q conflicts with [utilities] key %q (line %d)", label, a.Name, p.Name, a.Key(), utilLine)
 			}
 		}
 	}
